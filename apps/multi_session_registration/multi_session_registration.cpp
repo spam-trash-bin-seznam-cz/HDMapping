@@ -174,6 +174,8 @@ std::set<int> visible_sessions;
 int index_gt = -1;
 int old_index_gt = -1;
 int index_gizmo = -1;
+//!< Scan index of the gizmo session used as the gizmo pivot (rotation point).
+int gizmo_pivot_index = 0;
 int old_index_gizmo = -1;
 
 double time_stamp_offset = 0.0;
@@ -398,6 +400,13 @@ void ndt_gui()
         ndt.sigma_azimuthal_angle = 8.0 / 3600;
     }
 #endif
+}
+
+// Clamped pivot scan index for the session gizmo.
+size_t gizmoPivot(const Session& s)
+{
+    const int n = static_cast<int>(s.point_clouds_container.point_clouds.size());
+    return static_cast<size_t>(std::clamp(gizmo_pivot_index, 0, std::max(n - 1, 0)));
 }
 
 // Places the edge gizmo at the active edge's target pose.
@@ -1935,6 +1944,29 @@ void settings_gui()
 {
     if (ImGui::Begin("Settings", &is_settings_gui))
     {
+        {
+            // Scan index of the gizmo session where the session gizmo (rotation pivot) sits.
+            const int prev_pivot = gizmo_pivot_index;
+            ImGui::PushItemWidth(ImGuiNumberWidth * 2);
+            ImGui::InputInt("Gizmo trajectory index", &gizmo_pivot_index);
+            ImGui::PopItemWidth();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Index of the trajectory point (scan) of the Gizmo session where the gizmo is placed");
+            if (gizmo_pivot_index < 0)
+                gizmo_pivot_index = 0;
+            if (index_gizmo >= 0 && index_gizmo < (int)sessions.size() &&
+                !sessions[index_gizmo].point_clouds_container.point_clouds.empty())
+            {
+                const int n = (int)sessions[index_gizmo].point_clouds_container.point_clouds.size();
+                gizmo_pivot_index = std::min(gizmo_pivot_index, n - 1);
+                ImGui::SameLine();
+                ImGui::Text("(0 - %d)", n - 1);
+                if (prev_pivot != gizmo_pivot_index)
+                    setNewRotationCenter(
+                        sessions[index_gizmo].point_clouds_container.point_clouds[gizmo_pivot_index].m_pose.translation());
+            }
+            ImGui::Separator();
+        }
         ImGui::Checkbox("Downsample during load", &is_decimate);
         ImGui::SameLine();
         ImGui::Text("Bucket [m]:");
@@ -2269,7 +2301,8 @@ void settings_gui()
                     if (index_gizmo >= 0 && index_gizmo < sessions.size() &&
                         sessions[index_gizmo].point_clouds_container.point_clouds.size() > 0)
                     {
-                        setNewRotationCenter(sessions[index_gizmo].point_clouds_container.point_clouds[0].m_pose.translation());
+                        setNewRotationCenter(
+                            sessions[index_gizmo].point_clouds_container.point_clouds[gizmoPivot(sessions[index_gizmo])].m_pose.translation());
                     }
                     old_index_gt = index_gt;
                     old_index_gizmo = index_gizmo;
@@ -2288,7 +2321,7 @@ void settings_gui()
                     // Column-major 4x4, matching the Eigen::Map<const Eigen::Matrix4f>(m_gizmo)
                     // reads elsewhere in this file -- this is just that assignment reversed.
                     Eigen::Map<Eigen::Matrix4f> gizmo_map(m_gizmo);
-                    gizmo_map = sessions[index_gizmo].point_clouds_container.point_clouds[0].m_pose.matrix().cast<float>();
+                    gizmo_map = sessions[index_gizmo].point_clouds_container.point_clouds[gizmoPivot(sessions[index_gizmo])].m_pose.matrix().cast<float>();
                 }
             }
 
@@ -2893,7 +2926,8 @@ void display()
             {
                 if (sessions[i].point_clouds_container.point_clouds.size() > 0)
                 {
-                    prev_pose_manipulated = sessions[i].point_clouds_container.point_clouds[0].m_pose;
+                    const size_t pivot = gizmoPivot(sessions[i]);
+                    prev_pose_manipulated = sessions[i].point_clouds_container.point_clouds[pivot].m_pose;
                     std::vector<Eigen::Affine3d> all_m_poses;
                     for (size_t j = 0; j < sessions[i].point_clouds_container.point_clouds.size(); j++)
                         all_m_poses.push_back(sessions[i].point_clouds_container.point_clouds[j].m_pose);
@@ -2934,17 +2968,14 @@ void display()
                     // Candidate pose chain from this frame's gizmo value. Computed either way
                     // (cheap, CPU-only) but only ever written into the session data model --
                     // which is what triggers ScanRenderer's GPU re-upload -- once the drag ends.
-                    const Eigen::Affine3d new_pose0(Eigen::Map<const Eigen::Matrix4f>(m_gizmo).cast<double>());
-                    prev_pose_after_gismo = new_pose0;
+                    const Eigen::Affine3d new_pose_pivot(Eigen::Map<const Eigen::Matrix4f>(m_gizmo).cast<double>());
+                    prev_pose_after_gismo = new_pose_pivot;
 
-                    std::vector<Eigen::Affine3d> candidate_poses(sessions[i].point_clouds_container.point_clouds.size());
-                    candidate_poses[0] = new_pose0;
-                    Eigen::Affine3d curr_m_pose = new_pose0;
-                    for (size_t j = 1; j < all_m_poses.size(); j++)
-                    {
-                        curr_m_pose = curr_m_pose * (all_m_poses[j - 1].inverse() * all_m_poses[j]);
-                        candidate_poses[j] = curr_m_pose;
-                    }
+                    // Rigid motion of the whole session around the pivot scan.
+                    const Eigen::Affine3d delta = new_pose_pivot * prev_pose_manipulated.inverse();
+                    std::vector<Eigen::Affine3d> candidate_poses(all_m_poses.size());
+                    for (size_t j = 0; j < all_m_poses.size(); j++)
+                        candidate_poses[j] = delta * all_m_poses[j];
 
                     if (gizmo_dragging_this_frame)
                     {
